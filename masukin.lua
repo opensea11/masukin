@@ -1,10 +1,3 @@
---[[  Fly / NoClip / GodMode (LinearVelocity + AlignOrientation) – RESPawn FIX
-     - Session vs Character cleanup (input & main loop TIDAK diputus saat respawn)
-     - CoreGui ON by default
-     - Print aman via log(), default mute di live (M untuk toggle)
-]]
-
--- ====== SERVICES ======
 local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
 local RunService = game:GetService("RunService")
@@ -90,19 +83,53 @@ local function SnapToGround(maxDist)
   if r then HumanoidRootPart.CFrame = CFrame.new(r.Position + Vector3.new(0,5,0)) end
 end
 
--- ====== GODMODE (char-scoped) ======
+-- ====== TOUCH SHIELD (blokir damage lewat healing instan saat NoClip/God) ======
+local function TouchShield_On(part)
+  return trackCharConn(part.Touched:Connect(function(_)
+    if (GodMode or NoClipping) and Humanoid then
+      if Humanoid.Health < Humanoid.MaxHealth then
+        Humanoid.Health = Humanoid.MaxHealth
+      end
+    end
+  end))
+end
+
+local function SetupTouchShield()
+  -- hook semua BasePart di karakter + hook add/remove part baru
+  for _, d in ipairs(Character:GetDescendants()) do
+    if d:IsA("BasePart") then TouchShield_On(d) end
+  end
+  trackCharConn(Character.DescendantAdded:Connect(function(inst)
+    if inst:IsA("BasePart") then TouchShield_On(inst) end
+  end))
+end
+
+-- ====== GODMODE (char-scoped) – FALL LIMITER FIX ======
 local OriginalMaxHealth = nil
 local HealthConnection, HeartbeatConnection, StateConnection
+local FallAttach, FallLimiterVF
+local FALL_CAP_Y   = -45     -- batas maksimum kecepatan jatuh (stud/s)
+local FALL_MAX_ACC = 600     -- akselerasi ekstra maksimal (stud/s^2)
 
 local function StartGodMode()
-  if not Humanoid then return end
+  if not Humanoid or not HumanoidRootPart then return end
+
+  -- MaxHealth super tinggi + refill
   if not OriginalMaxHealth then OriginalMaxHealth = Humanoid.MaxHealth end
   Humanoid.MaxHealth = 9e9
   Humanoid.Health = Humanoid.MaxHealth
 
+  -- cegah ragdoll/fallingdown
+  pcall(function()
+    Humanoid:SetStateEnabled(Enum.HumanoidStateType.FallingDown, false)
+    Humanoid:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, false)
+  end)
+
   if HealthConnection then HealthConnection:Disconnect() end
   HealthConnection = trackCharConn(Humanoid.HealthChanged:Connect(function()
-    if GodMode and Humanoid then Humanoid.Health = Humanoid.MaxHealth end
+    if GodMode and Humanoid and Humanoid.Health < Humanoid.MaxHealth then
+      Humanoid.Health = Humanoid.MaxHealth
+    end
   end))
 
   if StateConnection then StateConnection:Disconnect() end
@@ -113,27 +140,53 @@ local function StartGodMode()
     end
   end))
 
-  -- Fall protection kecil (char-scoped)
+  -- Fall limiter (kontinu)
+  if not FallAttach or not FallAttach.Parent then
+    FallAttach = trackCharTemp(Instance.new("Attachment"))
+    FallAttach.Name = "God_FallAttach"
+    FallAttach.Parent = HumanoidRootPart
+  end
+  if not FallLimiterVF or not FallLimiterVF.Parent then
+    FallLimiterVF = trackCharTemp(Instance.new("VectorForce"))
+    FallLimiterVF.Name = "God_FallLimiter"
+    FallLimiterVF.Attachment0 = FallAttach
+    FallLimiterVF.RelativeTo = Enum.ActuatorRelativeTo.World
+    FallLimiterVF.Force = Vector3.zero
+    FallLimiterVF.Parent = HumanoidRootPart
+  end
+
   if HeartbeatConnection then HeartbeatConnection:Disconnect() end
-  HeartbeatConnection = trackCharConn(RunService.Heartbeat:Connect(function()
-    if not (GodMode and HumanoidRootPart) then return end
-    if HumanoidRootPart.AssemblyLinearVelocity.Y < -60 then
-      local bv = HumanoidRootPart:FindFirstChild("FallProtection")
-      if not bv then
-        bv = trackCharTemp(Instance.new("BodyVelocity"))
-        bv.Name = "FallProtection"
-        bv.MaxForce = Vector3.new(0, math.huge, 0)
-        bv.Velocity = Vector3.new(0, -25, 0)
-        bv.Parent = HumanoidRootPart
-        game:GetService("Debris"):AddItem(bv, 1)
-      end
+  HeartbeatConnection = trackCharConn(RunService.Heartbeat:Connect(function(dt)
+    if not (GodMode and HumanoidRootPart and FallLimiterVF) then return end
+    local vel = HumanoidRootPart.AssemblyLinearVelocity
+    if vel.Y < FALL_CAP_Y then
+      local needAcc = (FALL_CAP_Y - vel.Y) / math.max(dt, 1/240)
+      needAcc = math.clamp(needAcc, 0, FALL_MAX_ACC)
+      local mass = HumanoidRootPart.AssemblyMass
+      local g = workspace.Gravity
+      FallLimiterVF.Force = Vector3.new(0, mass * (g + needAcc), 0)
+    else
+      FallLimiterVF.Force = Vector3.zero
+    end
+    -- safety: refill terus
+    if Humanoid.Health < Humanoid.MaxHealth then
+      Humanoid.Health = Humanoid.MaxHealth
     end
   end))
 
-  log("🛡️ GodMode ON")
+  -- aktifkan TouchShield juga
+  SetupTouchShield()
+
+  GodMode = true
+  log("🛡️ GodMode ON (fall limiter + touch shield)")
 end
 
 local function StopGodMode()
+  pcall(function()
+    Humanoid:SetStateEnabled(Enum.HumanoidStateType.FallingDown, true)
+    Humanoid:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, true)
+  end)
+
   if OriginalMaxHealth and Humanoid then
     Humanoid.MaxHealth = OriginalMaxHealth
     Humanoid.Health = OriginalMaxHealth
@@ -141,8 +194,8 @@ local function StopGodMode()
   if HealthConnection then HealthConnection:Disconnect(); HealthConnection=nil end
   if HeartbeatConnection then HeartbeatConnection:Disconnect(); HeartbeatConnection=nil end
   if StateConnection then StateConnection:Disconnect(); StateConnection=nil end
-  local fp = HumanoidRootPart and HumanoidRootPart:FindFirstChild("FallProtection")
-  if fp then fp:Destroy() end
+  if FallLimiterVF then FallLimiterVF:Destroy(); FallLimiterVF=nil end
+  if FallAttach then FallAttach:Destroy(); FallAttach=nil end
   GodMode = false
   log("🩸 GodMode OFF")
 end
@@ -223,6 +276,8 @@ local function StartNoClip()
       part.CanCollide = false
     end
   end
+  -- aktifkan TouchShield juga saat noclip
+  SetupTouchShield()
   NoClipping = true
 end
 
@@ -575,10 +630,15 @@ trackSessConn(Player.CharacterAdded:Connect(function(newChar)
   curVel = Vector3.zero
   table.clear(OriginalCanCollide)
 
+  -- pasang TouchShield baru untuk karakter baru
+  SetupTouchShield()
+
   log("🔄 Respawn: character ready (input & loop tetap aktif)")
 end))
 
 -- ====== INIT ======
 LoadPrefs()
 buildMainGUI()
+-- TouchShield awal (buat karakter pertama)
+SetupTouchShield()
 log("🚀 Controls: F=Fly, N=NoClip, H=God, G=GUI, T=Teleport, M=Toggle Log | Method: "..NetworkMethod)
