@@ -1,8 +1,7 @@
---[[  Fly / NoClip / GodMode (LinearVelocity + AlignOrientation)
-     - Engine baru (tanpa BodyGyro/BodyVelocity utk gerak)
+--[[  Fly / NoClip / GodMode (LinearVelocity + AlignOrientation) – RESPawn FIX
+     - Session vs Character cleanup (input & main loop TIDAK diputus saat respawn)
      - CoreGui ON by default
-     - Print aman: dibungkus log(), default MUTE (kecuali di Studio)
-     - Toggle log: tekan M
+     - Print aman via log(), default mute di live (M untuk toggle)
 ]]
 
 -- ====== SERVICES ======
@@ -28,7 +27,7 @@ local DAMP  = 14
 local SPEED_MIN, SPEED_MAX = 1, 200
 
 -- ====== LOG AMAN ======
-local LOG_ENABLED = RunService:IsStudio() -- di Studio: ON, live: OFF
+local LOG_ENABLED = RunService:IsStudio()
 local function log(...) if LOG_ENABLED then print(...) end end
 
 -- ====== STATE ======
@@ -38,20 +37,27 @@ local GodMode = false
 local Speed = 60
 local NetworkMethod = "Linear" -- "Linear" | "CFrame" | "Humanoid"
 
--- New engine instances
-local Align, LinVel, Attach -- AlignOrientation, LinearVelocity, Attachment
+-- Engine baru (char-scoped)
+local Align, LinVel, Attach
 local curVel = Vector3.zero
 
--- Legacy refs (biar kode lama tetap jalan mulus)
-local BodyGyro, BodyVelocity = nil, nil -- mapped ke Align/LinVel
+-- ====== TRACKERS (Session vs Character) ======
+local sessConns, sessTemps = {}, {}
+local charConns, charTemps = {}, {}
 
--- Cleanup trackers
-local conns, temps = {}, {}
-local function trackConn(c) table.insert(conns, c); return c end
-local function trackTemp(i) table.insert(temps, i); return i end
-local function DisconnectAll()
-  for i=#conns,1,-1 do local c=conns[i]; if c and c.Connected then c:Disconnect() end; conns[i]=nil end
-  for i=#temps,1,-1 do local o=temps[i]; if o and o.Destroy then o:Destroy() end; temps[i]=nil end
+local function trackSessConn(c) table.insert(sessConns, c); return c end
+local function trackSessTemp(i) table.insert(sessTemps, i); return i end
+local function trackCharConn(c) table.insert(charConns, c); return c end
+local function trackCharTemp(i) table.insert(charTemps, i); return i end
+
+local function CleanupChar()
+  for i=#charConns,1,-1 do local c=charConns[i]; if c and c.Connected then c:Disconnect() end; charConns[i]=nil end
+  for i=#charTemps,1,-1 do local o=charTemps[i]; if o and o.Destroy then o:Destroy() end; charTemps[i]=nil end
+end
+
+local function CleanupSession()
+  for i=#sessConns,1,-1 do local c=sessConns[i]; if c and c.Connected then c:Disconnect() end; sessConns[i]=nil end
+  for i=#sessTemps,1,-1 do local o=sessTemps[i]; if o and o.Destroy then o:Destroy() end; sessTemps[i]=nil end
 end
 
 -- ====== PREFS (opsional) ======
@@ -60,11 +66,13 @@ local function SetSpeed(s)
   Speed = math.clamp(math.floor(s), SPEED_MIN, SPEED_MAX)
   if speedLabel then speedLabel.Text = ("✈️ Speed: %d"):format(Speed) end
 end
+
 local function SavePrefs()
   if not SAVE_PREFS or not writefile then return end
   local ok, enc = pcall(function() return HttpService:JSONEncode({Speed=Speed, Method=NetworkMethod}) end)
   if ok then writefile(CFG_NAME, enc) end
 end
+
 local function LoadPrefs()
   if not SAVE_PREFS or not (readfile and isfile and isfile(CFG_NAME)) then return end
   local ok, data = pcall(function() return HttpService:JSONDecode(readfile(CFG_NAME)) end)
@@ -82,7 +90,7 @@ local function SnapToGround(maxDist)
   if r then HumanoidRootPart.CFrame = CFrame.new(r.Position + Vector3.new(0,5,0)) end
 end
 
--- ====== GODMODE ======
+-- ====== GODMODE (char-scoped) ======
 local OriginalMaxHealth = nil
 local HealthConnection, HeartbeatConnection, StateConnection
 
@@ -93,26 +101,26 @@ local function StartGodMode()
   Humanoid.Health = Humanoid.MaxHealth
 
   if HealthConnection then HealthConnection:Disconnect() end
-  HealthConnection = trackConn(Humanoid.HealthChanged:Connect(function()
+  HealthConnection = trackCharConn(Humanoid.HealthChanged:Connect(function()
     if GodMode and Humanoid then Humanoid.Health = Humanoid.MaxHealth end
   end))
 
   if StateConnection then StateConnection:Disconnect() end
-  StateConnection = trackConn(Humanoid.StateChanged:Connect(function(_, new)
+  StateConnection = trackCharConn(Humanoid.StateChanged:Connect(function(_, new)
     if GodMode and new == Enum.HumanoidStateType.Dead then
       Humanoid:ChangeState(Enum.HumanoidStateType.Running)
       Humanoid.Health = Humanoid.MaxHealth
     end
   end))
 
-  -- NOTE: Fall protection masih pakai BodyVelocity kecil (cukup aman utk test)
+  -- Fall protection kecil (char-scoped)
   if HeartbeatConnection then HeartbeatConnection:Disconnect() end
-  HeartbeatConnection = trackConn(RunService.Heartbeat:Connect(function()
+  HeartbeatConnection = trackCharConn(RunService.Heartbeat:Connect(function()
     if not (GodMode and HumanoidRootPart) then return end
     if HumanoidRootPart.AssemblyLinearVelocity.Y < -60 then
       local bv = HumanoidRootPart:FindFirstChild("FallProtection")
       if not bv then
-        bv = trackTemp(Instance.new("BodyVelocity"))
+        bv = trackCharTemp(Instance.new("BodyVelocity"))
         bv.Name = "FallProtection"
         bv.MaxForce = Vector3.new(0, math.huge, 0)
         bv.Velocity = Vector3.new(0, -25, 0)
@@ -139,10 +147,10 @@ local function StopGodMode()
   log("🩸 GodMode OFF")
 end
 
--- ====== FLY (ENGINE BARU) ======
+-- ====== FLY (engine baru, char-scoped) ======
 local function EnsureAttachments()
   if not Attach or not Attach.Parent then
-    Attach = trackTemp(Instance.new("Attachment"))
+    Attach = trackCharTemp(Instance.new("Attachment"))
     Attach.Name = "Fly_Attachment"
     Attach.Parent = HumanoidRootPart
   end
@@ -151,22 +159,20 @@ end
 local function StartFlying_Linear()
   EnsureAttachments()
   if not LinVel then
-    LinVel = trackTemp(Instance.new("LinearVelocity"))
+    LinVel = trackCharTemp(Instance.new("LinearVelocity"))
     LinVel.Attachment0 = Attach
     LinVel.MaxForce = math.huge
     LinVel.VectorVelocity = Vector3.zero
     LinVel.Parent = HumanoidRootPart
   end
   if not Align then
-    Align = trackTemp(Instance.new("AlignOrientation"))
+    Align = trackCharTemp(Instance.new("AlignOrientation"))
     Align.Mode = Enum.OrientationAlignmentMode.OneAttachment
     Align.Attachment0 = Attach
     Align.MaxTorque = math.huge
     Align.Responsiveness = 50
     Align.Parent = HumanoidRootPart
   end
-  -- Map legacy refs:
-  BodyVelocity, BodyGyro = LinVel, Align
 end
 
 local function StartFlying_CFrame()
@@ -174,17 +180,15 @@ local function StartFlying_CFrame()
 end
 
 local function StartFlying_Humanoid()
-  -- Hybrid: tetap pakai LinearVelocity utk dorong halus, tapi orient biar Humanoid
   EnsureAttachments()
   if not LinVel then
-    LinVel = trackTemp(Instance.new("LinearVelocity"))
+    LinVel = trackCharTemp(Instance.new("LinearVelocity"))
     LinVel.Attachment0 = Attach
     LinVel.MaxForce = math.huge
     LinVel.VectorVelocity = Vector3.zero
     LinVel.Parent = HumanoidRootPart
   end
   if Humanoid then Humanoid.PlatformStand = true end
-  BodyVelocity = LinVel
 end
 
 local function StartFlying()
@@ -201,15 +205,15 @@ local function StopFlying()
   if Align then Align:Destroy(); Align=nil end
   if LinVel then LinVel:Destroy(); LinVel=nil end
   if Attach then Attach:Destroy(); Attach=nil end
-  BodyGyro, BodyVelocity = nil, nil
   if Humanoid then
     Humanoid.PlatformStand = false
     Humanoid:ChangeState(Enum.HumanoidStateType.Running)
   end
+  curVel = Vector3.zero
   SnapToGround(200)
 end
 
--- ====== NOCLIP ======
+-- ====== NOCLIP (char-scoped data) ======
 local OriginalCanCollide = {}
 local function StartNoClip()
   if not Character then return end
@@ -221,6 +225,7 @@ local function StartNoClip()
   end
   NoClipping = true
 end
+
 local function StopNoClip()
   if not Character then return end
   for _, part in ipairs(Character:GetChildren()) do
@@ -231,6 +236,7 @@ local function StopNoClip()
   table.clear(OriginalCanCollide)
   NoClipping = false
 end
+
 local function MaintainNoClip()
   if not (NoClipping and Character) then return end
   for _, part in ipairs(Character:GetChildren()) do
@@ -480,9 +486,9 @@ local function buildMainGUI()
   godButton.MouseButton1Click:Connect(function() SetGod(not GodMode) end)
 end
 
--- ====== INPUT ======
+-- ====== INPUT (SESSION-SCOPED) ======
 local lastTP = 0
-trackConn(UserInputService.InputBegan:Connect(function(input, gpe)
+trackSessConn(UserInputService.InputBegan:Connect(function(input, gpe)
   if gpe then return end
   if input.KeyCode == Enum.KeyCode.F then
     SetFly(not Flying)
@@ -507,8 +513,9 @@ trackConn(UserInputService.InputBegan:Connect(function(input, gpe)
   end
 end))
 
--- ====== MOVEMENT LOOP (inertia + engine baru) ======
-trackConn(RunService.RenderStepped:Connect(function(dt)
+-- ====== MAIN LOOP (SESSION-SCOPED) ======
+trackSessConn(RunService.RenderStepped:Connect(function(dt)
+  -- guard HRP/char
   if not Character or not Character.Parent or not HumanoidRootPart or not HumanoidRootPart:IsDescendantOf(Character) then
     return
   end
@@ -552,19 +559,23 @@ trackConn(RunService.RenderStepped:Connect(function(dt)
   MaintainNoClip()
 end))
 
--- ====== RESPAWN ======
-trackConn(Player.CharacterAdded:Connect(function(newChar)
-  DisconnectAll()
+-- ====== RESPAWN (SESSION-SCOPED HANDLER) ======
+trackSessConn(Player.CharacterAdded:Connect(function(newChar)
+  -- Bersihkan SEMUA yang terikat ke karakter lama
+  CleanupChar()
+
   Character = newChar
   Humanoid = Character:WaitForChild("Humanoid")
   HumanoidRootPart = Character:WaitForChild("HumanoidRootPart")
 
-  Flying = false; NoClipping = false; GodMode = false
+  -- Reset flag per-karakter (fitur tetap bisa dipakai lagi)
+  Flying = false
+  NoClipping = false
+  GodMode = false
   curVel = Vector3.zero
-  if Align then Align:Destroy(); Align=nil end
-  if LinVel then LinVel:Destroy(); LinVel=nil end
-  if Attach then Attach:Destroy(); Attach=nil end
-  log("🔄 Respawn: state reset")
+  table.clear(OriginalCanCollide)
+
+  log("🔄 Respawn: character ready (input & loop tetap aktif)")
 end))
 
 -- ====== INIT ======
